@@ -1,0 +1,134 @@
+# A deployable example, and the proof that the template scales sideways: two application
+# instances, identical and interchangeable, behind one nginx. Kill either one and the API
+# keeps answering.
+#
+#   cp .env.prod.example .env.prod && edit it
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#   curl -i http://127.0.0.1:8080/health        # X-Upstream alternates between the instances
+#
+# MongoDB and Redis are here to make the example self-contained. In a real deployment they
+# are managed services, and only the two `api-*` services and nginx belong to this file.
+name: social-prod
+
+# Shared by the instances and by the tooling container, so a command run by hand sees exactly
+# the configuration the running application sees.
+x-env: &env
+  NODE_ENV: production
+  PORT: 3000
+  # One proxy hop. Without it every request would look like it came from nginx, and the rate
+  # limiter would treat the whole internet as a single client.
+  TRUST_PROXY: '1'
+  DB_PROVIDER: mongodb
+  # The replica set is not optional: change streams and transactions both need one.
+  DATABASE_URL: mongodb://mongo:27017/social?replicaSet=rs0
+  REDIS_URL: redis://redis:6379
+  CORS_ORIGINS: ${CORS_ORIGINS:?list the front-end origins, comma separated}
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?generate one with openssl rand -base64 48}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?generate a different one}
+  MFA_SECRET_KEY: ${MFA_SECRET_KEY:?generate a third one — it decrypts the stored TOTP secrets}
+  DOCS_ENABLED: ${DOCS_ENABLED:-true}
+  DOCS_USER: ${DOCS_USER:-docs}
+  DOCS_PASSWORD: ${DOCS_PASSWORD:?the API reference is not public}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # No SMTP host and no S3 endpoint select the no-op mailer and storage, which log instead of
+  # sending. Set them for a real deployment.
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  MAIL_FROM: ${MAIL_FROM:-Social <no-reply@example.org>}
+  S3_ENDPOINT: ${S3_ENDPOINT:-}
+  S3_BUCKET: ${S3_BUCKET:-social-media}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+
+x-api: &api
+  image: social-api:latest
+  restart: unless-stopped
+  # PID 1 is an init that forwards signals, so `docker stop` reaches the graceful shutdown
+  # instead of being swallowed.
+  init: true
+  environment: *env
+  depends_on:
+    mongo: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    indexes: { condition: service_completed_successfully }
+
+services:
+  mongo:
+    image: mongo:8
+    restart: unless-stopped
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all']
+    volumes:
+      - mongo-data:/data/db
+    # The healthcheck also bootstraps the set on first boot: `rs.status()` throws until a set
+    # exists, and rs.initiate() is idempotent enough to be safe on every later probe.
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'mongosh --quiet --eval ''try { rs.status().ok } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongo:27017" }] }).ok }''',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Runs once and exits. MongoDB creates collections on first write, but not indexes: two
+  # instances building them at boot would race, and the feed is unusable without them.
+  #
+  # It doubles as the tooling container, because it is the only image that still holds the
+  # sources and the dev dependencies. That is how the first privileged account is created —
+  # nothing else can, since registration always produces an actor with no role:
+  #
+  #   docker compose --env-file .env.prod -f docker-compose.prod.yml \
+  #     run --rm indexes pnpm admin:create --email admin@example.org --password '…'
+  indexes:
+    build:
+      context: .
+      target: indexes
+    image: social-indexes:latest
+    restart: 'no'
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment: *env
+
+  # Built once, run twice. Only this service carries the build: two services building the same
+  # tag at the same time race to export it, and the second one fails.
+  api-1:
+    <<: *api
+    build:
+      context: .
+      target: runtime
+
+  api-2:
+    <<: *api
+    # Never reach for a registry: this tag only ever exists locally, built by api-1 above.
+    pull_policy: never
+
+  nginx:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    depends_on:
+      api-1: { condition: service_healthy }
+      api-2: { condition: service_healthy }
+    ports:
+      - '${HTTP_PORT:-8080}:80'
+    volumes:
+      # The directory, not the file: a bind-mounted single file keeps pointing at the inode it
+      # was mounted from, so editing the config would leave the container reading the old one.
+      - ./deploy/nginx:/etc/nginx/conf.d:ro
+
+volumes:
+  mongo-data:
+  redis-data:
